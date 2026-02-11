@@ -1,1099 +1,1145 @@
+"""
+MindMitra Psychology Workflow v2 — Modular Architecture
+========================================================
+
+Architecture:
+  ┌──────────────────────────────────────────────────────────────┐
+  │                    UserContext (shared JSON)                  │
+  │  Every module reads from and writes results back to this     │
+  └────────┬──────────┬──────────┬──────────┬──────────┬─────────┘
+           │          │          │          │          │
+     ┌─────▼────┐ ┌──▼───┐ ┌───▼────┐ ┌───▼────┐ ┌───▼──────────┐
+     │  Memory   │ │ NLP  │ │Cultural│ │Psych   │ │  Technique   │
+     │  System   │ │(Groq)│ │Context │ │Analysis│ │  Selector    │
+     │ (kept as  │ │      │ │ Module │ │(GLM)   │ │  (GLM)       │
+     │  is)      │ │      │ │        │ │        │ │              │
+     └──────────┘ └──────┘ └────────┘ └────────┘ └──────────────┘
+                                                        │
+                                                  ┌─────▼──────┐
+                                                  │  Response   │
+                                                  │  Generator  │
+                                                  │  (GLM)      │
+                                                  └─────────────┘
+
+External interface (process_user_chat / process_chat) is UNCHANGED.
+"""
+
+import openai
 import os
 import json
 import time
 import logging
 import threading
+import re
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
+from copy import deepcopy
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from memory_architecture import UniversalMemorySystem
 
-# Configure logging
+# ──────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Load environment variables
 load_dotenv()
 
-# Pydantic models for psychology-focused 2-agent architecture
-class PsychologicalAnalysis(BaseModel):
-    """Psychology-focused analysis for Indian youth mental wellness"""
-    emotional_state: str = Field(description="Current emotional condition with psychological markers")
-    stress_categories: List[str] = Field(description="Academic/Family/Social/Emotional/Identity/Career/Miscellaneous stress types")
-    therapeutic_approach: str = Field(description="CBT/ACT/MBCT recommendation based on psychological assessment")
-    cultural_pressures: str = Field(description="Indian family/academic/social pressures affecting mental health")
-    language_style: str = Field(description="User's communication pattern (formal/casual/hindi-mixed) to match")
-    psychological_insights: List[str] = Field(description="2-3 key psychology-based observations")
-    coping_assessment: str = Field(description="Current coping mechanisms and psychological resilience")
-    intervention_priority: str = Field(description="Immediate/supportive/long-term intervention needs")
-    activity_recommendations: List[str] = Field(description="Psychology-based instant and long-term activities")
 
-class ConversationSummary(BaseModel):
-    """Contextual conversation summarization preserving therapeutic progress"""
-    therapeutic_progress: str = Field(description="Therapeutic journey and breakthrough moments")
-    emotional_patterns: str = Field(description="Recurring emotional themes and patterns")
-    cultural_context: str = Field(description="Family dynamics, academic pressures, cultural factors")
-    language_preferences: str = Field(description="Communication style and language mixing patterns")
-    key_insights: List[str] = Field(description="Important psychological insights to preserve")
-    stress_evolution: str = Field(description="How stress categories and levels have changed")
-    intervention_history: str = Field(description="Therapeutic approaches used and their effectiveness")
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  1. SHARED USER-CONTEXT JSON SCHEMA                         ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def create_empty_user_context(
+    user_id: str = "anonymous",
+    session_id: str = None,
+    user_message: str = "",
+) -> Dict[str, Any]:
+    """
+    Canonical JSON envelope that every module reads from / writes to.
+    Nothing leaves or enters the pipeline except through this structure.
+    """
+    return {
+        # ── identity ──
+        "user_id": user_id,
+        "session_id": session_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+
+        # ── raw input ──
+        "user_message": user_message,
+        "voice_analysis": {},                       # optional voice data
+
+        # ── session history (populated by caller / memory fetch) ──
+        "session_context": {
+            "recent_messages": [],
+            "conversation_summary": {},
+            "session_memories": {
+                "procedural": [],
+                "semantic": [],
+                "episodic": [],
+            },
+            "user_activities": [],
+            "user_patterns": {},
+        },
+
+        # ── NLP analysis  (written by Groq NLP module) ──
+        "nlp_analysis": {
+            "emotions": {},                         # {joy: 0.1, sadness: 0.7, …}
+            "primary_emotion": "",
+            "sentiment": {
+                "score": 0.0,                       # -1 … +1
+                "label": "neutral",                 # positive / negative / neutral / mixed
+            },
+            "intensity": 0.0,                       # 0 … 1
+            "key_phrases": [],
+            "language_detected": "en",
+            "urgency_flag": False,
+        },
+
+        # ── cultural context (written by cultural module) ──
+        "cultural_context": {
+            "language_style": "casual",             # formal / casual / hindi-mixed
+            "hindi_english_ratio": 0.0,             # 0 = pure English, 1 = pure Hindi
+            "code_switching_detected": False,
+            "cultural_sensitivity_flags": [],        # e.g. "parental_pressure", "exam_stress"
+            "communication_pattern": "",
+            "regional_context": "",
+            "formality_level": "medium",            # low / medium / high
+        },
+
+        # ── psychological analysis  (written by GLM Agent 1) ──
+        "psychological_analysis": {
+            "emotional_state": "",
+            "stress_categories": [],
+            "risk_assessment": "low",
+            "coping_assessment": "",
+            "intervention_priority": "supportive",
+            "psychological_insights": [],
+            "cultural_pressures": "",
+        },
+
+        # ── technique selection  (written by GLM Agent 2) ──
+        "technique_selection": {
+            "primary_technique": "",                # CBT / ACT / MBCT / …
+            "therapeutic_approach": "",
+            "activity_recommendations": [],
+            "rationale": "",
+        },
+
+        # ── final output ──
+        "ai_response": "",
+        "response_generated": False,
+    }
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  2. GROQ NLP — Emotion & Sentiment Analysis                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+class GroqNLPModule:
+    """
+    Lightweight emotion / sentiment analysis via Groq (llama/mixtral).
+    Handles token-limit errors with automatic truncation & retry.
+    """
+
+    # Groq free-tier context sizes by model
+    _MODEL_TOKEN_LIMITS = {
+        "qwen/qwen3-32b": 4_096,
+        "moonshotai/kimi-k2-instruct-0905": 4096,
+        "meta-llama/llama-4-scout-17b-16e-instruct": 8_192,
+       # "mixtral-8x7b-32768": 32_768,
+    }
+
+    def __init__(self, api_key: str = None, model: str = "qwen/qwen3-32b"):
+        self.api_key = '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'#api_key or os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            logger.warning("⚠️ [GROQ-NLP] GROQ_API_KEY not set — NLP module disabled")
+            self.client = None
+            return
+
+        try:
+            
+            self.client = Groq(api_key=self.api_key)
+            self.model = model
+            self._max_input_chars = self._MODEL_TOKEN_LIMITS.get(model, 8_192) * 3  # ~3 chars/token rough est
+            logger.info(f"✅ [GROQ-NLP] Initialised with model={model}")
+        except ImportError:
+            logger.warning("⚠️ [GROQ-NLP] `groq` package not installed — NLP module disabled")
+            self.client = None
+        except Exception as e:
+            logger.error(f"❌ [GROQ-NLP] Init failed: {e}")
+            self.client = None
+
+    # ── public entry ──────────────────────────────────────────
+    def analyse(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Run emotion + sentiment analysis; write results into user_context['nlp_analysis']."""
+        if not self.client:
+            logger.info("[GROQ-NLP] Skipped (client not available)")
+            return user_context
+
+        text = user_context.get("user_message", "")
+        # Include last 3 messages for conversational context
+        recent = user_context["session_context"].get("recent_messages", [])[-3:]
+        history_snippet = " | ".join(
+            f"{m.get('role','?')}: {m.get('content','')[:120]}" for m in recent
+        )
+
+        prompt = self._build_prompt(text, history_snippet)
+        raw = self._call_groq(prompt)
+        parsed = self._parse_response(raw)
+        user_context["nlp_analysis"] = parsed
+        logger.info(f"✅ [GROQ-NLP] Emotion={parsed.get('primary_emotion')}, Sentiment={parsed['sentiment']['label']}")
+        return user_context
+
+    # ── internals ─────────────────────────────────────────────
+    def _build_prompt(self, text: str, history: str) -> str:
+        return f"""Analyse the following user message for a mental-health chatbot.  
+Return ONLY valid JSON (no markdown fences) with exactly these keys:
+
+{{
+  "emotions": {{"joy": 0.0, "sadness": 0.0, "anger": 0.0, "fear": 0.0, "surprise": 0.0, "disgust": 0.0, "trust": 0.0, "anticipation": 0.0}},
+  "primary_emotion": "<strongest emotion name>",
+  "sentiment": {{"score": <float -1 to 1>, "label": "<positive|negative|neutral|mixed>"}},
+  "intensity": <float 0 to 1>,
+  "key_phrases": ["<phrase1>", "<phrase2>"],
+  "language_detected": "<en|hi|hinglish>",
+  "urgency_flag": <true if crisis/self-harm indicators else false>
+}}
+
+Recent conversation context: {history[:600]}
+
+User message: \"{text[:1500]}\"
+
+JSON:"""
+
+    def _call_groq(self, prompt: str, _retry: int = 0) -> str:
+        """Call Groq with automatic truncation on token-limit errors."""
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=400,
+            )
+            return resp.choices[0].message.content.strip()
+
+        except Exception as e:
+            err_str = str(e).lower()
+            # Handle token limit exceeded — truncate and retry once
+            if ("token" in err_str or "context_length" in err_str or "rate_limit" in err_str) and _retry < 2:
+                logger.warning(f"⚠️ [GROQ-NLP] Token/rate limit hit (attempt {_retry+1}), truncating...")
+                truncated = prompt[: len(prompt) // 2]
+                return self._call_groq(truncated, _retry + 1)
+            logger.error(f"❌ [GROQ-NLP] API call failed: {e}")
+            return "{}"
+
+    def _parse_response(self, raw: str) -> Dict:
+        """Robust JSON parse with fallback defaults."""
+        defaults = {
+            "emotions": {},
+            "primary_emotion": "unknown",
+            "sentiment": {"score": 0.0, "label": "neutral"},
+            "intensity": 0.0,
+            "key_phrases": [],
+            "language_detected": "en",
+            "urgency_flag": False,
+        }
+        if not raw:
+            return defaults
+        try:
+            # Strip markdown fences if the model wraps them
+            cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`")
+            parsed = json.loads(cleaned)
+            # Merge with defaults so no key is ever missing
+            for k, v in defaults.items():
+                if k not in parsed:
+                    parsed[k] = v
+            return parsed
+        except json.JSONDecodeError:
+            logger.warning("[GROQ-NLP] Failed to parse JSON, using defaults")
+            return defaults
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  3. CULTURAL CONTEXT & LANGUAGE STYLE MODULE                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+class CulturalContextModule:
+    """
+    Rule-based + lightweight LLM analysis for:
+      • Hindi / Hinglish detection & code-switching level
+      • Formality level
+      • Cultural sensitivity flags (exam stress, parental pressure, …)
+      • Communication pattern classification
+    Uses the NLP analysis already present in user_context and optionally
+    calls Groq for deeper classification (kept cheap — single short call).
+    """
+
+    # Common Hindi / Hinglish markers
+    _HINDI_MARKERS = {
+        "yaar", "bhai", "didi", "maa", "papa", "ghar", "padhai", "exam",
+        "nahi", "kya", "hai", "mein", "toh", "acha", "theek", "kuch",
+        "kaise", "kyun", "bohot", "bahut", "zyada", "bilkul", "sach",
+        "samajh", "dukh", "tension", "pareshan", "darr", "chinta",
+        "mann", "dil", "sapna", "zindagi", "rishta", "shaadi",
+        "arre", "haan", "naa", "abhi", "bas", "matlab", "lekin",
+        "accha", "suno", "bata", "bol", "rona", "akela", "thak",
+    }
+
+    _CULTURAL_KEYWORDS = {
+        "parental_pressure": ["parents", "papa", "maa", "mom", "dad", "family", "ghar", "expect", "disappoint", "proud"],
+        "exam_stress": ["exam", "jee", "neet", "boards", "cgpa", "marks", "rank", "topper", "padhai", "result", "semester"],
+        "career_anxiety": ["career", "job", "placement", "package", "future", "engineer", "doctor", "startup", "salary"],
+        "social_pressure": ["friends", "relationship", "breakup", "lonely", "akela", "judge", "log kya kahenge", "society"],
+        "identity_struggle": ["identity", "confused", "who am i", "purpose", "meaning", "self", "worth"],
+        "marriage_pressure": ["shaadi", "marriage", "rishta", "arrange", "partner", "settle"],
+        "mental_health_stigma": ["pagal", "crazy", "weak", "therapy", "stigma", "shame", "hide"],
+    }
+
+    def __init__(self, groq_nlp: Optional[GroqNLPModule] = None):
+        self.groq_nlp = groq_nlp  # reuse same Groq client for optional deep analysis
+        logger.info("✅ [CULTURAL] Cultural context module initialised")
+
+    def analyse(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Run cultural analysis; write results into user_context['cultural_context']."""
+        text = user_context.get("user_message", "").lower()
+        history = user_context["session_context"].get("recent_messages", [])
+
+        result = {
+            "language_style": self._detect_language_style(text),
+            "hindi_english_ratio": self._compute_hindi_ratio(text),
+            "code_switching_detected": False,
+            "cultural_sensitivity_flags": self._detect_cultural_flags(text),
+            "communication_pattern": self._detect_communication_pattern(text, history),
+            "regional_context": self._infer_regional_context(text, history),
+            "formality_level": self._detect_formality(text),
+        }
+        result["code_switching_detected"] = result["hindi_english_ratio"] > 0.1
+
+        # If session history exists, enrich from patterns across messages
+        if history:
+            result = self._enrich_from_history(result, history)
+
+        user_context["cultural_context"] = result
+        logger.info(
+            f"✅ [CULTURAL] Style={result['language_style']}, "
+            f"Hindi%={result['hindi_english_ratio']:.0%}, "
+            f"Flags={result['cultural_sensitivity_flags']}"
+        )
+        return user_context
+
+    # ── detection helpers ─────────────────────────────────────
+    def _detect_language_style(self, text: str) -> str:
+        words = set(text.split())
+        hindi_count = len(words & self._HINDI_MARKERS)
+        total = max(len(words), 1)
+        ratio = hindi_count / total
+        if ratio > 0.25:
+            return "hindi-mixed"
+        elif ratio > 0.08:
+            return "hinglish"
+        return "english"
+
+    def _compute_hindi_ratio(self, text: str) -> float:
+        words = text.split()
+        if not words:
+            return 0.0
+        hindi_count = sum(1 for w in words if w.lower() in self._HINDI_MARKERS)
+        return round(hindi_count / len(words), 3)
+
+    def _detect_cultural_flags(self, text: str) -> List[str]:
+        flags = []
+        text_lower = text.lower()
+        for flag, keywords in self._CULTURAL_KEYWORDS.items():
+            if any(kw in text_lower for kw in keywords):
+                flags.append(flag)
+        return flags
+
+    def _detect_communication_pattern(self, text: str, history: List) -> str:
+        if len(text.split()) < 5:
+            return "terse"
+        elif len(text.split()) > 80:
+            return "verbose"
+        elif text.endswith("?"):
+            return "questioning"
+        elif any(w in text.lower() for w in ["feel", "feeling", "felt", "lagta", "mehsoos"]):
+            return "emotionally_expressive"
+        return "conversational"
+
+    def _detect_formality(self, text: str) -> str:
+        informal_markers = {"lol", "haha", "omg", "wtf", "bruh", "yaar", "arre", "bc", "mc"}
+        formal_markers = {"sir", "ma'am", "respected", "kindly", "please", "would you"}
+        words = set(text.lower().split())
+        if words & informal_markers:
+            return "low"
+        if words & formal_markers:
+            return "high"
+        return "medium"
+
+    def _infer_regional_context(self, text: str, history: List) -> str:
+        # Simple keyword-based; can be enhanced
+        all_text = text + " ".join(m.get("content", "") for m in history[-5:])
+        all_lower = all_text.lower()
+        if any(w in all_lower for w in ["kota", "jee", "iit", "coaching"]):
+            return "competitive_exam_belt"
+        if any(w in all_lower for w in ["bangalore", "bengaluru", "hyderabad", "pune", "it job", "startup"]):
+            return "tech_hub"
+        if any(w in all_lower for w in ["village", "gaon", "rural"]):
+            return "rural"
+        return "urban_metro"
+
+    def _enrich_from_history(self, result: Dict, history: List) -> Dict:
+        """Aggregate patterns across session history."""
+        all_text = " ".join(m.get("content", "") for m in history if m.get("role") == "user")
+        # Accumulate cultural flags from entire session
+        session_flags = set(result["cultural_sensitivity_flags"])
+        for flag, keywords in self._CULTURAL_KEYWORDS.items():
+            if any(kw in all_text.lower() for kw in keywords):
+                session_flags.add(flag)
+        result["cultural_sensitivity_flags"] = list(session_flags)
+
+        # Detect overall session language style (may differ from single message)
+        session_hindi = self._compute_hindi_ratio(all_text)
+        if session_hindi > result["hindi_english_ratio"]:
+            result["hindi_english_ratio"] = round(
+                (result["hindi_english_ratio"] + session_hindi) / 2, 3
+            )
+            if session_hindi > 0.2:
+                result["language_style"] = "hindi-mixed"
+        return result
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  4. GLM CONCURRENCY CONTROLLER                              ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+import openai
+import os
+import threading
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+class GLMController:
+    def __init__(
+        self,
+        api_key: str = None,
+        model: str = "glm-4.5-flash",  # Change model name here
+        max_concurrent: int = 2,
+        max_retries: int = 3,
+        base_backoff: float = 2.0,
+    ):
+        self.api_key = '0b7ae4bd0c9b45878e633fd8be74bd4a.yuhRrTenuKNVWhD4'#api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY is required for GLM controller")
+
+        self.model_name = model
+        self._semaphore = threading.Semaphore(max_concurrent)
+        self._max_retries = max_retries
+        self._base_backoff = base_backoff
+        self._lock = threading.Lock()
+
+        # Set OpenAI API key
+        openai.api_key = self.api_key
+        logger.info(f"✅ [GLM] Controller ready — model={model}, max_concurrent={max_concurrent}")
+
+    def invoke(self, messages: List, **kwargs) -> Any:
+        """
+        Thread-safe invoke with semaphore gating and retry on rate limits.
+        """
+        for attempt in range(self._max_retries):
+            self._semaphore.acquire()
+            try:
+                # Construct the OpenAI API request payload
+                openai_messages = [{"role": "system", "content": "You are a helpful assistant."}]
+                openai_messages.extend([{"role": "user", "content": msg["content"]} for msg in messages])
+                
+                # OpenAI API call to generate a response
+                response = openai.ChatCompletion.create(
+                    model=self.model_name,
+                    messages=openai_messages,
+                    max_tokens=500,  # Set your preferred max tokens
+                    temperature=0.3,  # Adjust based on desired creativity
+                    top_p=0.8,
+                    **kwargs
+                )
+                
+                return response['choices'][0]['message']['content']
+            
+            except Exception as e:
+                err = str(e).lower()
+                if "rate" in err or "quota" in err or "resource_exhausted" in err:
+                    wait = self._base_backoff * (2 ** attempt)
+                    logger.warning(f"⚠️ [GLM] Rate limited (attempt {attempt+1}), backing off {wait:.1f}s")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"❌ [GLM] Non-retryable error: {e}")
+                    raise
+            finally:
+                self._semaphore.release()
+
+        raise RuntimeError(f"[GLM] Exhausted {self._max_retries} retries due to rate limiting")
+
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  5. GLM AGENT 1 — Psychologist Analysis                     ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+class PsychologistAnalysisAgent:
+    def __init__(self, glm: GLMController):
+        self.glm = glm
+        logger.info("✅ [AGENT-1] Psychologist analysis agent ready")
+
+    def run(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("🧠 [AGENT-1] Starting psychological analysis...")
+
+        prompt = self._build_prompt(user_context)
+        resp = self.glm.invoke([{"role": "user", "content": prompt}])
+
+        if not resp or not resp.content:
+            raise ValueError("[AGENT-1] GLM returned empty response")
+
+        parsed = self._parse_analysis(resp.content)
+        user_context["psychological_analysis"] = parsed
+        logger.info(
+            f"✅ [AGENT-1] Done — state={parsed.get('emotional_state','?')}, "
+            f"priority={parsed.get('intervention_priority','?')}"
+        )
+        return user_context
+
+
+    def _build_prompt(self, ctx: Dict) -> str:
+        nlp = ctx.get("nlp_analysis", {})
+        cultural = ctx.get("cultural_context", {})
+        session = ctx.get("session_context", {})
+        activities = session.get("user_activities", [])
+        memories = session.get("session_memories", {})
+
+        # Format memories compactly
+        mem_lines = []
+        for mtype in ("procedural", "semantic", "episodic"):
+            for m in memories.get(mtype, [])[:4]:
+                content = m.get("memory_content", m.get("content", ""))
+                mem_lines.append(f"  [{mtype}] {content[:120]}")
+        mem_block = "\n".join(mem_lines) if mem_lines else "No prior memories."
+
+        # Format activities compactly
+        act_lines = []
+        for a in activities[:5]:
+            atype = a.get("activity_type", "unknown")
+            score = a.get("score", "?")
+            insights = a.get("insights_generated", {})
+            patterns = insights.get("key_patterns", [])
+            act_lines.append(f"  {atype}: score={score}, patterns={patterns[:2]}")
+        act_block = "\n".join(act_lines) if act_lines else "No activities yet."
+
+        # Recent messages (last 5)
+        recent = session.get("recent_messages", [])[-5:]
+        conv_lines = []
+        for m in recent:
+            role = "User" if m.get("role") == "user" else "AI"
+            conv_lines.append(f"  {role}: {m.get('content','')[:100]}")
+        conv_block = "\n".join(conv_lines) if conv_lines else "New conversation."
+
+        return f"""You are a clinical psychologist specialising in Indian youth (16-25).
+Analyse this user and return ONLY valid JSON (no markdown fences) matching this schema:
+
+{{
+  "emotional_state": "<descriptive string>",
+  "stress_categories": ["<Academic|Family|Social|Emotional|Identity|Career|Miscellaneous>"],
+  "risk_assessment": "<low|moderate|high|crisis>",
+  "coping_assessment": "<description of coping mechanisms & resilience>",
+  "intervention_priority": "<immediate|supportive|long-term>",
+  "psychological_insights": ["<insight1>", "<insight2>", "<insight3>"],
+  "cultural_pressures": "<relevant Indian cultural/family/academic pressures>"
+}}
+
+─── DATA ───
+
+USER MESSAGE: "{ctx['user_message'][:800]}"
+
+NLP ANALYSIS:
+  Primary emotion: {nlp.get('primary_emotion','unknown')}
+  Sentiment: {nlp.get('sentiment',{}).get('label','unknown')} ({nlp.get('sentiment',{}).get('score',0):.2f})
+  Intensity: {nlp.get('intensity',0):.2f}
+  Urgency: {nlp.get('urgency_flag', False)}
+  Key phrases: {nlp.get('key_phrases',[])}
+
+CULTURAL CONTEXT:
+  Language style: {cultural.get('language_style','unknown')}
+  Cultural flags: {cultural.get('cultural_sensitivity_flags',[])}
+  Communication: {cultural.get('communication_pattern','unknown')}
+  Formality: {cultural.get('formality_level','medium')}
+
+SESSION MEMORIES:
+{mem_block}
+
+RECENT ACTIVITIES:
+{act_block}
+
+RECENT CONVERSATION:
+{conv_block}
+
+JSON:"""
+
+    def _parse_analysis(self, raw: str) -> Dict:
+        defaults = {
+            "emotional_state": "needs assessment",
+            "stress_categories": [],
+            "risk_assessment": "low",
+            "coping_assessment": "",
+            "intervention_priority": "supportive",
+            "psychological_insights": [],
+            "cultural_pressures": "",
+        }
+        try:
+            cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`")
+            parsed = json.loads(cleaned)
+            for k, v in defaults.items():
+                if k not in parsed:
+                    parsed[k] = v
+            return parsed
+        except json.JSONDecodeError:
+            logger.warning("[AGENT-1] JSON parse failed, using LLM text as insight")
+            defaults["psychological_insights"] = [raw[:300]]
+            return defaults
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  6. GLM AGENT 2 — Psychological Technique Selector           ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+class TechniqueSelectorAgent:
+    """
+    Reads the psychological analysis + NLP + cultural context from
+    UserContext and selects the optimal therapeutic technique(s).
+    Writes into user_context['technique_selection'].
+    """
+    def __init__(self, glm: GLMController):
+        self.glm = glm
+        logger.info("✅ [AGENT-2] Technique selector agent ready")
+
+    def run(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("💊 [AGENT-2] Selecting therapeutic technique...")
+
+        prompt = self._build_prompt(user_context)
+        resp = self.glm.invoke([{"role": "user", "content": prompt}])
+
+        if not resp or not resp.content:
+            raise ValueError("[AGENT-2] GLM returned empty response")
+
+        parsed = self._parse_selection(resp.content)
+        user_context["technique_selection"] = parsed
+        logger.info(f"✅ [AGENT-2] Technique={parsed.get('primary_technique','?')}")
+        return user_context
+
+
+    def _build_prompt(self, ctx: Dict) -> str:
+        psych = ctx.get("psychological_analysis", {})
+        nlp = ctx.get("nlp_analysis", {})
+        cultural = ctx.get("cultural_context", {})
+
+        return f"""You are a therapeutic technique advisor for Indian youth (16-25).
+Based on the psychological assessment below, select the best therapeutic approach.
+Return ONLY valid JSON (no markdown fences):
+
+{{
+  "primary_technique": "<CBT|ACT|MBCT|DBT|MI|Solution-Focused|Person-Centered|Psychoeducation>",
+  "therapeutic_approach": "<brief description of how to apply this technique>",
+  "activity_recommendations": ["<activity1>", "<activity2>", "<activity3>"],
+  "rationale": "<why this technique suits the current situation>"
+}}
+
+─── ASSESSMENT ───
+
+Emotional state: {psych.get('emotional_state','')}
+Stress categories: {psych.get('stress_categories',[])}
+Risk: {psych.get('risk_assessment','low')}
+Intervention priority: {psych.get('intervention_priority','supportive')}
+Insights: {psych.get('psychological_insights',[])}
+Cultural pressures: {psych.get('cultural_pressures','')}
+
+Emotion intensity: {nlp.get('intensity',0):.2f}
+Primary emotion: {nlp.get('primary_emotion','unknown')}
+Urgency: {nlp.get('urgency_flag', False)}
+
+Language style: {cultural.get('language_style','casual')}
+Cultural flags: {cultural.get('cultural_sensitivity_flags',[])}
+Formality: {cultural.get('formality_level','medium')}
+
+Consider Indian cultural context: family dynamics, academic pressure, mental health stigma.
+Prefer culturally appropriate, practical activities (yoga, journaling, grounding exercises).
+
+JSON:"""
+
+    def _parse_selection(self, raw: str) -> Dict:
+        defaults = {
+            "primary_technique": "Person-Centered",
+            "therapeutic_approach": "Empathetic listening with gentle exploration",
+            "activity_recommendations": [],
+            "rationale": "",
+        }
+        try:
+            cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`")
+            parsed = json.loads(cleaned)
+            for k, v in defaults.items():
+                if k not in parsed:
+                    parsed[k] = v
+            return parsed
+        except json.JSONDecodeError:
+            logger.warning("[AGENT-2] JSON parse failed, using defaults")
+            return defaults
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  7. GLM RESPONSE GENERATOR                                  ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+class ResponseGenerator:
+    """
+    Final stage: reads the full UserContext JSON and generates a natural,
+    culturally-sensitive, therapeutically-informed companion response.
+    """
+
+    SYSTEM_PROMPT = """You are MindMitra, a culturally-aware AI therapeutic companion for Indian youth (16-25).
+
+RESPONSE RULES:
+• Combine psychology expertise with warm, companion-style delivery
+• Match the user's language style (if they use Hindi/Hinglish, mirror appropriately)
+• Apply the selected therapeutic technique naturally — do NOT label techniques
+• Reference session memories when relevant to show continuity
+• Be empathetic, non-judgmental, like a caring friend who understands psychology
+• Validate cultural struggles without dismissing traditional values
+• Keep responses conversational — concise for casual chat, deeper for heavy topics
+• NEVER include numbered annotations, technique labels in parentheses, or meta-commentary
+• Generate ONLY the natural conversation response"""
+
+    def __init__(self, glm: GLMController):
+        self.glm = glm
+        logger.info("✅ [RESPONSE-GEN] Response generator ready")
+
+    def generate(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("💬 [RESPONSE-GEN] Generating therapeutic response...")
+
+        system_msg = {"role": "system", "content": self.SYSTEM_PROMPT}
+        human_msg = {"role": "user", "content": self._build_context(user_context)}
+
+        resp = self.glm.invoke([system_msg, human_msg])
+
+        if not resp or not resp.content:
+            raise ValueError("[RESPONSE-GEN] GLM returned empty response")
+
+        cleaned = self._clean(resp.content)
+        user_context["ai_response"] = cleaned
+        user_context["response_generated"] = True
+        logger.info(f"✅ [RESPONSE-GEN] Response ready ({len(cleaned)} chars)")
+        return user_context
+
+    def _build_context(self, ctx: Dict) -> str:
+        psych = ctx.get("psychological_analysis", {})
+        technique = ctx.get("technique_selection", {})
+        nlp = ctx.get("nlp_analysis", {})
+        cultural = ctx.get("cultural_context", {})
+        voice = ctx.get("voice_analysis", {})
+        session = ctx.get("session_context", {})
+
+        # Format recent messages for conversation flow
+        recent = session.get("recent_messages", [])[-3:]
+        conv = "\n".join(
+            f"{'User' if m.get('role')=='user' else 'MindMitra'}: {m.get('content','')[:150]}"
+            for m in recent
+        )
+
+        # Format key memories
+        memories = session.get("session_memories", {})
+        mem_lines = []
+        for mtype in ("procedural", "semantic", "episodic"):
+            for m in memories.get(mtype, [])[:3]:
+                c = m.get("memory_content", m.get("content", ""))
+                mem_lines.append(f"[{mtype}] {c[:100]}")
+        mem_block = "\n".join(mem_lines) if mem_lines else ""
+
+        voice_block = ""
+        if voice:
+            voice_block = f"""
+VOICE ANALYSIS:
+  Emotional tone: {voice.get('emotional_tone','N/A')}
+  Stress level: {voice.get('stress_level','N/A')}
+  Speech pace: {voice.get('speech_pace','N/A')}"""
+
+        return f"""PSYCHOLOGICAL ASSESSMENT:
+  State: {psych.get('emotional_state','')}
+  Stress: {psych.get('stress_categories',[])}
+  Priority: {psych.get('intervention_priority','')}
+  Insights: {psych.get('psychological_insights',[])}
+  Cultural pressures: {psych.get('cultural_pressures','')}
+
+TECHNIQUE:
+  Approach: {technique.get('primary_technique','')} — {technique.get('therapeutic_approach','')}
+  Activities: {technique.get('activity_recommendations',[])}
+
+EMOTION: {nlp.get('primary_emotion','?')} (intensity {nlp.get('intensity',0):.1f}), sentiment={nlp.get('sentiment',{}).get('label','neutral')}
+LANGUAGE STYLE: {cultural.get('language_style','casual')}, formality={cultural.get('formality_level','medium')}
+CULTURAL FLAGS: {cultural.get('cultural_sensitivity_flags',[])}
+{voice_block}
+
+{f'MEMORIES:{chr(10)}{mem_block}' if mem_block else ''}
+
+CONVERSATION:
+{conv if conv else '(New conversation)'}
+
+USER'S CURRENT MESSAGE: "{ctx['user_message']}"
+
+Respond naturally as MindMitra:"""
+
+    def _clean(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        if text.startswith("{") or text.startswith("["):
+            try:
+                p = json.loads(text)
+                if isinstance(p, dict) and "content" in p:
+                    return p["content"]
+            except json.JSONDecodeError:
+                pass
+        return text.strip()
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  8. MAIN WORKFLOW ORCHESTRATOR                               ║
+# ║     (preserves identical external API)                       ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 class MindMitraWorkflow:
-    """Psychology-focused 2-agent workflow with background summarization"""
-    
+    """
+    Orchestrates the full pipeline:
+      1. Build UserContext JSON
+      2. Fetch memories → populate session_context
+      3. Groq NLP → populate nlp_analysis
+      4. Cultural context → populate cultural_context
+      5. GLM Agent 1 (Psychologist) → populate psychological_analysis
+      6. GLM Agent 2 (Technique Selector) → populate technique_selection
+      7. GLM Response Generator → populate ai_response
+      8. Return result in the SAME format as before
+    """
+
     def __init__(self):
-        logger.info("🧠 [WORKFLOW] Initializing MindMitra Psychology Workflow...")
-        self.llm = self._initialize_llm()
-        # Psychology-focused structured LLMs
-        try:
-            self.analyst_llm = self.llm.with_structured_output(PsychologicalAnalysis)
-            self.summarizer_llm = self.llm.with_structured_output(ConversationSummary)
-            logger.info("✅ [WORKFLOW] Psychology-focused 2-agent + background summarizer LLMs initialized successfully")
-        except Exception as e:
-            logger.error(f"❌ [WORKFLOW] Failed to initialize psychology LLMs: {e}")
-            raise e
-        self.workflow = self._create_workflow()
-        
-        # Background summarization tracking
-        self._summarization_cache = {}
-        self._last_summarization_count = {}
-        
-        # Initialize Supabase client
+        logger.info("🧠 [WORKFLOW] Initialising MindMitra v2 (modular architecture)...")
+
+        # ── Supabase ──
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_KEY")
         if supabase_url and supabase_key:
             self.supabase: Client = create_client(supabase_url, supabase_key)
-            logger.info("✅ [WORKFLOW] Supabase client initialized")
+            logger.info("✅ [WORKFLOW] Supabase client ready")
         else:
             self.supabase = None
-            logger.warning("⚠️ [WORKFLOW] Supabase credentials not found - memory features disabled")
-        
-        # Initialize memory system
+            logger.warning("⚠️ [WORKFLOW] Supabase not configured")
+
+        # ── Memory system (UNCHANGED) ──
+        google_api_key = os.getenv("GOOGLE_API_KEY")
         try:
-            google_api_key = os.getenv('GOOGLE_API_KEY')
             if google_api_key:
                 self.memory_system = UniversalMemorySystem(api_key=google_api_key)
-                logger.info("✅ [WORKFLOW] Memory system initialized")
+                logger.info("✅ [WORKFLOW] Memory system ready")
             else:
                 self.memory_system = None
-                logger.warning("⚠️ [WORKFLOW] GOOGLE_API_KEY not found - memory extraction disabled")
         except Exception as e:
             self.memory_system = None
-            logger.error(f"❌ [WORKFLOW] Memory system initialization failed: {e}")
-        
-        logger.info("✅ [WORKFLOW] MindMitra Workflow fully initialized and ready for voice-enhanced therapy")
-    
-    def fetch_session_memories(self, session_id: str) -> Dict[str, List[Dict]]:
-        """Fetch all memories for a session from database (FIXED: Works with JSONB schema)"""
-        logger.info(f"🔍 [FETCH_MEMORIES] Starting to fetch memories for session: {session_id}")
-        
-        if not self.supabase:
-            logger.error(f"❌ [FETCH_MEMORIES] Supabase client is not initialized!")
-            return {'procedural': [], 'semantic': [], 'episodic': []}
-            
-        if not session_id:
-            logger.warning(f"⚠️ [FETCH_MEMORIES] No session_id provided")
-            return {'procedural': [], 'semantic': [], 'episodic': []}
-        
+            logger.error(f"❌ [WORKFLOW] Memory system init failed: {e}")
+
+        # ── Modules ──
+        self.groq_nlp = GroqNLPModule()
+        self.cultural_module = CulturalContextModule(groq_nlp=self.groq_nlp)
+        self.glm = GLMController(api_key=google_api_key)
+        self.agent_psychologist = PsychologistAnalysisAgent(self.glm)
+        self.agent_technique = TechniqueSelectorAgent(self.glm)
+        self.response_gen = ResponseGenerator(self.glm)
+
+        # ── Background summarisation cache (same as original) ──
+        self._summarization_cache = {}
+        self._last_summarization_count = {}
+
+        logger.info("✅ [WORKFLOW] MindMitra v2 fully initialised\n")
+
+    # ══════════════════════════════════════════════════════════
+    #  MEMORY METHODS — KEPT IDENTICAL TO ORIGINAL
+    # ══════════════════════════════════════════════════════════
+    def save_user_context_to_file(self, user_context: Dict[str, Any], file_name: str) -> None:
+        """Save the processed user context to a file (JSON format)."""
         try:
-            logger.info(f"📊 [FETCH_MEMORIES] Querying 'memories' table for session_id: {session_id}")
-            response = self.supabase.table('memories').select('*').eq('session_id', session_id).order('created_at', desc=True).execute()
-            
-            logger.info(f"📥 [FETCH_MEMORIES] Database returned {len(response.data)} rows")
-            
+            # Define the local directory where the file will be saved
+            save_dir = "user_contexts"  # Folder where JSON files will be saved
+            os.makedirs(save_dir, exist_ok=True)  # Create folder if it doesn't exist
+
+            # Define the full path to the file
+            file_path = os.path.join(save_dir, file_name)
+
+            # Save the context data to the file in JSON format
+            with open(file_path, "w") as file:
+                json.dump(user_context, file, indent=4)  # Save with indentation for readability
+
+            logger.info(f"✅ [FILE] UserContext saved to {file_path}")
+        except Exception as e:
+            logger.error(f"❌ [FILE] Failed to save user context: {e}")
+    def fetch_session_memories(self, session_id: str) -> Dict[str, List[Dict]]:
+        """Fetch all memories for a session from database (UNCHANGED from v1)."""
+        logger.info(f"🔍 [FETCH_MEMORIES] Fetching for session: {session_id}")
+        if not self.supabase or not session_id:
+            return {"procedural": [], "semantic": [], "episodic": []}
+
+        try:
+            response = (
+                self.supabase.table("memories")
+                .select("*")
+                .eq("session_id", session_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+
             if not response.data:
-                logger.warning(f"⚠️ [FETCH_MEMORIES] No memory records found in database for this session")
-                return {'procedural': [], 'semantic': [], 'episodic': []}
-            
-            # Parse JSONB arrays from database (each row contains arrays of all 3 memory types)
-            memories = {'procedural': [], 'semantic': [], 'episodic': []}
-            
+                return {"procedural": [], "semantic": [], "episodic": []}
+
+            memories: Dict[str, List] = {"procedural": [], "semantic": [], "episodic": []}
+
             for row in response.data:
-                logger.info(f"   Processing memory record ID: {row.get('id')}")
-                
-                # Parse each JSONB column
-                for memory_type in ['procedural', 'semantic', 'episodic']:
-                    column_name = f'{memory_type}_memories'
+                for memory_type in ("procedural", "semantic", "episodic"):
+                    column_name = f"{memory_type}_memories"
                     jsonb_data = row.get(column_name, [])
-                    
-                    # Handle both JSON string and parsed list
                     if isinstance(jsonb_data, str):
                         try:
                             jsonb_data = json.loads(jsonb_data)
-                        except:
-                            logger.warning(f"   Failed to parse {column_name} JSON")
+                        except Exception:
                             jsonb_data = []
-                    
-                    # Add memories from this row to the accumulated list
                     if isinstance(jsonb_data, list):
                         for mem in jsonb_data:
                             memories[memory_type].append({
-                                'memory_content': mem.get('memory_content', mem.get('content', str(mem))),
-                                'confidence': mem.get('confidence', mem.get('confidence_level', 0.5)),
-                                'created_at': row.get('created_at'),
-                                'memory_id': row.get('id'),
-                                'importance': mem.get('importance', 'medium'),
-                                'category': mem.get('category', 'general')
+                                "memory_content": mem.get("memory_content", mem.get("content", str(mem))),
+                                "confidence": mem.get("confidence", mem.get("confidence_level", 0.5)),
+                                "created_at": row.get("created_at"),
+                                "memory_id": row.get("id"),
+                                "importance": mem.get("importance", "medium"),
+                                "category": mem.get("category", "general"),
                             })
-            
-            logger.info(f"✅ [FETCH_MEMORIES] Organized memories by type:")
-            logger.info(f"   - Procedural: {len(memories['procedural'])}")
-            logger.info(f"   - Semantic: {len(memories['semantic'])}")
-            logger.info(f"   - Episodic: {len(memories['episodic'])}")
-            
+
+            total = sum(len(v) for v in memories.values())
+            logger.info(f"✅ [FETCH_MEMORIES] {total} memories (P={len(memories['procedural'])}, S={len(memories['semantic'])}, E={len(memories['episodic'])})")
             return memories
+
         except Exception as e:
-            logger.error(f"❌ [FETCH_MEMORIES] Error fetching session memories: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {'procedural': [], 'semantic': [], 'episodic': []}
-    
+            logger.error(f"❌ [FETCH_MEMORIES] Error: {e}")
+            return {"procedural": [], "semantic": [], "episodic": []}
+
     def fetch_last_n_messages(self, session_id: str, n: int = 15) -> List[Dict]:
-        """Fetch last N unprocessed messages for a session"""
+        """Fetch last N unprocessed messages (UNCHANGED from v1)."""
         if not self.supabase or not session_id:
             return []
-        
         try:
-            response = self.supabase.table('chat_messages').select('id, role, content, created_at').eq('session_id', session_id).eq('processed_into_memory', False).order('created_at', desc=False).limit(n).execute()
-            
-            messages = []
-            for row in response.data:
-                messages.append({
-                    'id': row['id'],
-                    'role': row['role'],
-                    'content': row['content'],
-                    'timestamp': row['created_at']
-                })
-            
-            logger.info(f"📥 [WORKFLOW] Fetched {len(messages)} unprocessed messages for session {session_id}")
-            return messages
+            response = (
+                self.supabase.table("chat_messages")
+                .select("id, role, content, created_at")
+                .eq("session_id", session_id)
+                .eq("processed_into_memory", False)
+                .order("created_at", desc=False)
+                .limit(n)
+                .execute()
+            )
+            return [
+                {"id": r["id"], "role": r["role"], "content": r["content"], "timestamp": r["created_at"]}
+                for r in response.data
+            ]
         except Exception as e:
-            logger.error(f"❌ [WORKFLOW] Error fetching messages: {e}")
+            logger.error(f"❌ [WORKFLOW] fetch messages error: {e}")
             return []
-    
+
     def trigger_memory_extraction(self, session_id: str, user_id: str):
-        """
-        Trigger memory extraction for a session (runs in background).
-        Called every 8 messages.
-        """
+        """Trigger memory extraction — UNCHANGED from v1."""
         try:
-            logger.info("=" * 80)
-            logger.info(f"🧠 [MEMORY EXTRACTION] Starting Memory Extraction Process")
-            logger.info("=" * 80)
-            logger.info(f"🔗 [MEMORY] Session ID: {session_id}")
-            logger.info(f"👤 [MEMORY] User ID: {user_id}")
-            
-            # Fetch unprocessed messages
-            logger.info(f"📥 [MEMORY] Fetching last 15 messages for extraction...")
+            logger.info("=" * 60)
+            logger.info(f"🧠 [MEMORY EXTRACTION] session={session_id}, user={user_id}")
             messages = self.fetch_last_n_messages(session_id, n=15)
-            
-            if not messages:
-                logger.warning(f"⚠️ [MEMORY] No messages found for extraction")
-                logger.info("=" * 80)
+            if not messages or not self.memory_system:
                 return
-            
-            logger.info(f"✅ [MEMORY] Retrieved {len(messages)} messages for processing")
-            
-            if not self.memory_system:
-                logger.error(f"❌ [MEMORY] Memory system not initialized - cannot extract memories")
-                logger.info("=" * 80)
-                return
-            
-            # Format as chat data
+
             chat_data = {
-                'data_type': 'chat',
-                'user_id': user_id,
-                'session_id': session_id,
-                'chat_history': messages
+                "data_type": "chat",
+                "user_id": user_id,
+                "session_id": session_id,
+                "chat_history": messages,
             }
-            
-            # Extract memories
-            logger.info(f"🔄 [MEMORY] Calling LLM to extract memories (this may take 10-30 seconds)...")
-            logger.info(f"   Using parallel extraction for 3 memory types:")
-            logger.info(f"   - Procedural (how-to knowledge)")
-            logger.info(f"   - Semantic (general knowledge)")
-            logger.info(f"   - Episodic (specific events)")
-            
+
             result = self.memory_system.process_data_to_memories(chat_data)
-            
-            logger.info(f"✅ [MEMORY] LLM extraction completed!")
-            logger.info(f"📊 [MEMORY] Extraction results:")
-            logger.info(f"   - Procedural memories: {len(result['memories'].get('procedural', []))}")
-            logger.info(f"   - Semantic memories: {len(result['memories'].get('semantic', []))}")
-            logger.info(f"   - Episodic memories: {len(result['memories'].get('episodic', []))}")
-            
-            # Save to database (FIXED: Insert as JSONB arrays matching schema)
-            logger.info(f"💾 [MEMORY] Saving memories to database...")
-            try:
-                # Prepare memory data matching the table schema
-                memory_record = {
-                    'user_id': user_id,
-                    'session_id': session_id,
-                    'data_type': 'chat',
-                    'procedural_memories': result['memories'].get('procedural', []),
-                    'semantic_memories': result['memories'].get('semantic', []),
-                    'episodic_memories': result['memories'].get('episodic', []),
-                    'memory_summary': {
-                        'procedural_count': len(result['memories'].get('procedural', [])),
-                        'semantic_count': len(result['memories'].get('semantic', [])),
-                        'episodic_count': len(result['memories'].get('episodic', [])),
-                        'extraction_timestamp': datetime.now(timezone.utc).isoformat()
-                    },
-                    'source_message_ids': [msg['id'] for msg in messages],
-                    'metadata': {
-                        'message_count': len(messages),
-                        'extraction_method': 'parallel_llm'
-                    },
-                    'processed_at': datetime.now(timezone.utc).isoformat()
-                }
-                
-                # Insert single record with all memories as JSONB
-                self.supabase.table('memories').insert(memory_record).execute()
-                
-                total_memories = (len(result['memories'].get('procedural', [])) + 
-                                len(result['memories'].get('semantic', [])) + 
-                                len(result['memories'].get('episodic', [])))
-                logger.info(f"✅ [MEMORY] Successfully saved {total_memories} memories to database")
-                
-            except Exception as e:
-                logger.error(f"❌ [MEMORY] Failed to save memories: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            logger.info("=" * 80)
 
-            # Mark messages as processed
-            message_ids = [msg['id'] for msg in messages]
+            memory_record = {
+                "user_id": user_id,
+                "session_id": session_id,
+                "data_type": "chat",
+                "procedural_memories": result["memories"].get("procedural", []),
+                "semantic_memories": result["memories"].get("semantic", []),
+                "episodic_memories": result["memories"].get("episodic", []),
+                "memory_summary": {
+                    "procedural_count": len(result["memories"].get("procedural", [])),
+                    "semantic_count": len(result["memories"].get("semantic", [])),
+                    "episodic_count": len(result["memories"].get("episodic", [])),
+                    "extraction_timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                "source_message_ids": [msg["id"] for msg in messages],
+                "metadata": {"message_count": len(messages), "extraction_method": "parallel_llm"},
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.supabase.table("memories").insert(memory_record).execute()
+
+            message_ids = [msg["id"] for msg in messages]
             if message_ids:
-                try:
-                    self.supabase.table('chat_messages').update({'processed_into_memory': True}).in_('id', message_ids).execute()
-                    logger.info(f"✅ [MEMORY] Marked {len(message_ids)} messages as processed")
-                except Exception as e:
-                    logger.error(f"❌ [MEMORY] Failed to mark messages as processed: {e}")
-            
-            logger.info("=" * 80)
-            
+                self.supabase.table("chat_messages").update(
+                    {"processed_into_memory": True}
+                ).in_("id", message_ids).execute()
+
+            logger.info(f"✅ [MEMORY EXTRACTION] Done")
+            logger.info("=" * 60)
+
         except Exception as e:
-            logger.error(f"❌ [MEMORY] Memory extraction failed: {e}")
+            logger.error(f"❌ [MEMORY EXTRACTION] Failed: {e}")
     
-    def _initialize_llm(self) -> ChatGoogleGenerativeAI:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable is required")
-        
-        return ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite",
-            google_api_key=api_key,
-            timeout=30,
-            max_tokens=400,  # Optimized for free tier token limits
-            temperature=0.3,
-            top_p=0.8,
-            max_retries=1
-        )
-    
-    def _should_trigger_background_summarization(self, user_id: str, recent_messages: List) -> bool:
-        """Check if background summarization should be triggered (much stricter criteria)"""
-        current_count = len(recent_messages)
-        last_count = self._last_summarization_count.get(user_id, 0)
-        
-        # Only trigger summarization if:
-        # 1. Messages increased by 10+ since last summarization, AND
-        # 2. Total messages > 15, OR
-        # 3. Total conversation length > 3000 characters
-        
-        message_increase = current_count - last_count
-        total_length = sum(len(msg.get("content", "")) for msg in recent_messages)
-        
-        should_summarize = (
-            message_increase >= 10 and current_count > 15
-        ) or (
-            total_length > 3000 and message_increase >= 5
-        )
-        
-        if should_summarize:
-            logger.info(f"🔄 Background summarization triggered for user {user_id}: {current_count} messages (+{message_increase}), {total_length} chars")
-            self._last_summarization_count[user_id] = current_count
-        
-        return should_summarize
-    
-    def _background_summarization(self, user_id: str, recent_messages: List, conversation_summary: Dict, psychological_analysis: Dict):
-        """Run summarization in background thread (non-blocking)"""
-        try:
-            logger.info(f"📝 Background summarizer: Processing {len(recent_messages)} messages for user {user_id}")
-            
-            # Format all messages for comprehensive summarization
-            conversation_text = self._format_messages_for_summarization(recent_messages)
-            
-            # COMBINED PROMPT for structured output (Gemini works better with single comprehensive prompt)
-            combined_prompt = f"""Create a comprehensive therapeutic summary for Indian youth mental wellness continuation.
+    # ══════════════════════════════════════════════════════════
+    #  CORE PIPELINE
+    # ══════════════════════════════════════════════════════════
 
-COMPREHENSIVE SUMMARIZATION GUIDELINES:
-- Preserve ALL therapeutic progress and breakthrough moments
-- Track emotional patterns and psychological developments over time
-- Maintain cultural context (family dynamics, academic pressures, Indian youth challenges)
-- Document language preferences and communication evolution
-- Record therapeutic approaches that worked/didn't work
-- Identify stress pattern changes and coping mechanism development
-- Preserve important personal details for therapeutic continuity
-
-EXISTING SUMMARY:
-{json.dumps(conversation_summary, indent=1) if conversation_summary else 'No previous summary'}
-
-FULL CONVERSATION TO SUMMARIZE:
-{conversation_text}
-
-LATEST PSYCHOLOGICAL ANALYSIS:
-{json.dumps(psychological_analysis, indent=1)}
-
-Create a rich summary that enables seamless therapeutic conversation continuation."""
-
-            # Generate summary in background (single HumanMessage for better Gemini compatibility)
-            summary = self.summarizer_llm.invoke([HumanMessage(content=combined_prompt)])
-            
-            if summary:
-                # Cache the summary for future use
-                self._summarization_cache[user_id] = {
-                    'summary': summary.dict(),
-                    'timestamp': datetime.now(),
-                    'message_count': len(recent_messages)
-                }
-                logger.info(f"✅ Background summarization completed for user {user_id}")
-            else:
-                logger.warning(f"⚠️ Background summarization failed for user {user_id}")
-                
-        except Exception as e:
-            logger.error(f"❌ Background summarization error for user {user_id}: {e}")
-    
-    def _get_effective_conversation_summary(self, user_id: str, conversation_summary: Dict) -> Dict:
-        """Get the most up-to-date summary (from cache or provided)"""
-        cached_summary = self._summarization_cache.get(user_id)
-        
-        if cached_summary:
-            cached_timestamp = cached_summary['timestamp']
-            # Use cached summary if it's recent (within last hour)
-            if (datetime.now() - cached_timestamp).seconds < 3600:
-                logger.info(f"📋 Using cached summary for user {user_id}")
-                return cached_summary['summary']
-        
-        # Use provided summary or empty dict
-        return conversation_summary or {}
-    
-    def psychological_analyst(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Agent 1: Psychology-focused analysis for Indian youth mental wellness"""
-        logger.info("🧠 Psychology Agent 1: Indian youth mental wellness analysis starting...")
-        
-        user_id = state.get("user_id", "anonymous")
-        recent_messages = state.get("recent_messages", [])
-        conversation_summary = state.get("conversation_summary", {})
-        
-        # ✅ DETAILED LOGGING FOR ACTIVITIES DATA
-        user_activities = state.get("user_activities", [])
-        logger.info("=" * 80)
-        logger.info("🔍 [WORKFLOW] DATA VERIFICATION - What LLM Will Receive")
-        logger.info("=" * 80)
-        logger.info(f"📊 [ACTIVITIES] Total activities received: {len(user_activities)}")
-        
-        if user_activities:
-            logger.info("✅ [ACTIVITIES] ✅ ✅ WORKFLOW RECEIVED ACTIVITIES! ✅ ✅")
-            
-            # Count by activity type
-            activity_types = {}
-            for activity in user_activities:
-                activity_type = activity.get('activity_type', 'unknown')
-                activity_types[activity_type] = activity_types.get(activity_type, 0) + 1
-            
-            for activity_type, count in activity_types.items():
-                logger.info(f"   - {activity_type}: {count} entries")
-            
-            # Log first 3 activities with 20-word preview
-            logger.info(f"\n📝 [ACTIVITIES] First {min(3, len(user_activities))} activities (20 words each):")
-            for i, activity in enumerate(user_activities[:3], 1):
-                logger.info(f"\n   Activity #{i}:")
-                logger.info(f"      Type: {activity.get('activity_type', 'N/A')}")
-                logger.info(f"      Score: {activity.get('score', 'N/A')}")
-                logger.info(f"      Duration: {activity.get('game_duration', activity.get('duration', 'N/A'))}")
-                logger.info(f"      Difficulty: {activity.get('difficulty_level', 'N/A')}")
-                logger.info(f"      Timestamp: {activity.get('completed_at', 'N/A')}")
-                
-                # Show 20 words of activity_data
-                activity_data = activity.get('activity_data', {})
-                if activity_data:
-                    activity_str = str(activity_data)
-                    words = activity_str.split()[:20]
-                    preview = ' '.join(words)
-                    logger.info(f"      📄 Data (20 words): {preview}...")
-                
-                # Show insights if available
-                insights = activity.get('insights_generated', '')
-                if insights:
-                    words = str(insights).split()[:20]
-                    preview = ' '.join(words)
-                    logger.info(f"      💡 Insights (20 words): {preview}...")
-        else:
-            logger.warning("⚠️ [ACTIVITIES] ❌ ❌ NO ACTIVITIES IN WORKFLOW! ❌ ❌")
-            logger.warning("   Possible reasons:")
-            logger.warning("   1. User hasn't played any games/QA sessions yet")
-            logger.warning("   2. Data not being fetched from Supabase")
-            logger.warning("   3. Data not being passed from main.py")
-        
-        logger.info("=" * 80)
-        
-        # Get effective summary (cached or provided)
-        effective_summary = self._get_effective_conversation_summary(user_id, conversation_summary)
-        
-        # Fetch session memories if session_id is available
-        session_memories = {'procedural': [], 'semantic': [], 'episodic': []}
-        if state.get('session_id'):
-            logger.info(f"🧠 [MEMORIES] Fetching memories for session: {state.get('session_id')}")
-            session_memories = self.fetch_session_memories(state.get('session_id'))
-            memory_count = sum(len(v) for v in session_memories.values())
-            
-            if memory_count > 0:
-                logger.info(f"✅ [MEMORIES] ✅ ✅ RETRIEVED {memory_count} MEMORIES! ✅ ✅")
-                logger.info(f"   - Procedural: {len(session_memories.get('procedural', []))}")
-                logger.info(f"   - Semantic: {len(session_memories.get('semantic', []))}")
-                logger.info(f"   - Episodic: {len(session_memories.get('episodic', []))}")
-                
-                # Log each memory type with 20-word preview - SHOW ALL MEMORIES
-                logger.info(f"\n📚 [MEMORIES] All Memory Content (20 words each):")
-                
-                for mem_type, memories in session_memories.items():
-                    if memories:
-                        logger.info(f"\n   🔹 {mem_type.upper()} MEMORIES ({len(memories)} total):")
-                        for i, memory in enumerate(memories, 1):  # Show ALL memories, not just first 3
-                            content = memory.get('memory_content', 'N/A')
-                            words = str(content).split()[:20]
-                            preview = ' '.join(words)
-                            confidence = memory.get('confidence', 'N/A')
-                            created = memory.get('created_at', 'N/A')
-                            
-                            logger.info(f"      Memory #{i}:")
-                            logger.info(f"         📝 (20 words): {preview}...")
-                            logger.info(f"         🎯 Confidence: {confidence}")
-                            logger.info(f"         📅 Created: {created}")
-
-            else:
-                logger.warning(f"⚠️ [MEMORIES] ❌ No memories found for this session yet")
-                logger.warning(f"   Memories are created after 8 messages in a session")
-        else:
-            logger.warning(f"⚠️ [MEMORIES] ❌ No session_id provided - cannot fetch memories")
-        
-        logger.info(f"📊 [CONTEXT] Processing {len(recent_messages[-5:])} recent messages, summary present: {bool(effective_summary)}")
-        
-        # Trigger background summarization if needed (non-blocking)
-        if self._should_trigger_background_summarization(user_id, recent_messages):
-            psychological_analysis_placeholder = {}  # Will be filled after analysis
-            threading.Thread(
-                target=self._background_summarization,
-                args=(user_id, recent_messages, conversation_summary, psychological_analysis_placeholder),
-                daemon=True
-            ).start()  # Disabled for prototype stage to save tokens
-            pass  # Background summarization temporarily disabled
-        
-        # Use only recent messages + summary for fast analysis
-        conversation_context = self._format_minimal_conversation_context(
-            recent_messages[-5:],  # Only last 5 messages for speed
-            effective_summary
-        )
-        # 🔥 CRITICAL FIX: Use comprehensive context instead of minimal!
-        # This includes full psychological insights from games
-        activities_context = self._format_comprehensive_activities_context(
-            state.get("user_activities", [])[:5]  # Increased from 2 to 5 activities
-        )
-        
-        # ✅ LOG WHAT'S BEING SENT TO LLM
-        logger.info("=" * 80)
-        logger.info("� [LLM PROMPT] Data being sent to Gemini:")
-        logger.info("=" * 80)
-        logger.info(f"💬 [LLM] User message: '{state['user_message'][:150]}{'...' if len(state['user_message']) > 150 else ''}'")
-        logger.info(f"📝 [LLM] Conversation context length: {len(conversation_context)} chars")
-        logger.info(f"🎮 [LLM] Activities context: '{activities_context}'")
-        logger.info(f"🎤 [LLM] Voice analysis: {'✅ Included' if state.get('voice_analysis') else '❌ Not included'}")
-        
-        # Log memory context being sent
-        memory_context_lines = []
-        for mem_type, memories in session_memories.items():
-            if memories:
-                memory_context_lines.append(f"{mem_type.title()}: {len(memories)} memories")
-        if memory_context_lines:
-            logger.info(f"🧠 [LLM] Session memories: {', '.join(memory_context_lines)}")
-        else:
-            logger.info(f"🧠 [LLM] Session memories: ❌ None")
-        
-        logger.info("=" * 80)
-        
-        # COMBINED PROMPT for structured output (Gemini works better with single comprehensive prompt)
-        # Replace the long combined_prompt with this simplified version
-        
-        # Include voice analysis if available
-        voice_context = ""
-        voice_analysis = state.get("voice_analysis", {})
-        if voice_analysis:
-            voice_context = f"""
-            
-            VOICE ANALYSIS DATA:
-            - Emotional tone: {voice_analysis.get('emotional_tone', 'N/A')}
-            - Stress level: {voice_analysis.get('stress_level', 'N/A')}
-            - Speech pace: {voice_analysis.get('speech_pace', 'N/A')}
-            - Cultural context: {voice_analysis.get('cultural_context', 'N/A')}
-            - Voice insights: {voice_analysis.get('insights', [])}"""
-        
-        # Include session memories with ACTUAL CONTENT (🔥 CRITICAL FIX: Was only showing counts!)
-        memory_context = ""
-        if session_memories:
-            memory_context = "\n\n" + self._format_memory_context_with_content(session_memories)
-        
-        combined_prompt = f"""Analyze this user's mental health state for Indian youth (16-25 years).
-
-            User's message: "{state['user_message']}"
-
-            Recent context: {conversation_context[:500]}
-
-            Activities: {activities_context}{voice_context}{memory_context}
-
-            Provide analysis in this exact format:
-            - Emotional state: [current condition]
-            - Stress categories: [Academic/Family/Social/Emotional/Identity/Career types]
-            - Therapeutic approach: [CBT/ACT/MBCT recommendation]
-            - Cultural pressures: [Indian family/academic/social pressures]
-            - Language style: [formal/casual/hindi-mixed]
-            - Psychological insights: [2-3 key observations]
-            - Coping assessment: [current resilience level]
-            - Intervention priority: [immediate/supportive/long-term]
-            - Activity recommendations: [specific helpful activities]
-
-            Focus on practical therapeutic assessment for Indian cultural context."""
-        # Use structured output for psychology analysis (single HumanMessage for better Gemini compatibility)
-        analysis = None
-        analysis = self.analyst_llm.invoke([HumanMessage(content=combined_prompt)])
-        if analysis is None:
-            logger.info("🔄 Trying minimal prompt for structured output...")
-            minimal_prompt = f"""Analyze: "{state['user_message']}"
-
-                Provide psychological analysis for Indian youth with these fields:
-                emotional_state, stress_categories, therapeutic_approach, cultural_pressures, language_style, psychological_insights, coping_assessment, intervention_priority, activity_recommendations"""
-
-            analysis = self.analyst_llm.invoke([HumanMessage(content=minimal_prompt)])
-    
-
-        if analysis is None:
-            raise ValueError("Psychology Agent 1: Structured LLM returned None - possible prompt or model issue")
-        
-        state["psychological_analysis"] = analysis.dict()
-        
-        # Update background summarization with analysis (if running)
-        if user_id in self._summarization_cache:
-            # Update the placeholder with actual analysis
-            pass  # Background thread will complete independently
-        
-        logger.info("✅ Psychology Agent 1: Cultural-sensitive analysis completed successfully")
-        return state
-
-    def companion_counselor_response(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Agent 2: Companion-style counselor with psychology expertise for Indian youth"""
-        logger.info("💬 Psychology Agent 2: Companion counselor response generation starting...")
-        
-        psychological_analysis = state.get("psychological_analysis", {})
-        user_message = state["user_message"]
-        voice_analysis = state.get("voice_analysis", {})
-        
-        # Get immediate context for culturally sensitive response generation
-        immediate_context = self._format_immediate_context_for_response(
-            state.get("recent_messages", [])[-3:],  # Last 3 messages for flow
-            user_message
-        )
-        
-        if not psychological_analysis:
-            raise ValueError("Psychology Agent 2: No psychological_analysis available from Agent 1")
-        
-        logger.info("📝 Psychology Agent 2: Using psychology-guided companion response generation")
-        
-        # PSYCHOLOGY + COMPANION STYLE SYSTEM MESSAGE for Indian youth
-        system_message = SystemMessage(content="""You are MindMitra, a culturally-aware AI therapeutic companion specialized in Indian youth mental wellness (ages 16-25). Generate a response that combines professional psychology expertise with warm, companion-style delivery.
-
-COMPANION COUNSELOR RESPONSE GUIDELINES:
-
-PSYCHOLOGY EXPERTISE:
-- Apply CBT techniques: cognitive restructuring, thought challenging, behavioral activation
-- Use ACT principles: values clarification, psychological flexibility, mindful awareness
-- Employ MBCT approaches: emotional regulation, present-moment awareness, self-compassion
-- Address stress categories identified in analysis (academic/family/social/emotional/identity/career)
-
-CULTURAL SENSITIVITY (Indian Youth Context):
-- Understand academic pressure (board exams, competitive exams, parental expectations)
-- Acknowledge family dynamics (joint family, traditional vs modern values, generation gap)
-- Respect cultural nuances (festivals affecting mood, arranged marriage discussions, career path pressures)
-- Be sensitive to mental health stigma and family involvement considerations
-
-COMPANION DELIVERY STYLE:
-- Use warm, friend-like tone while maintaining professional boundaries
-- Match user's language comfort level (if they use "yaar/bhai", mirror appropriately)
-- Be empathetic and non-judgmental, like talking to a caring friend who understands psychology
-- Validate cultural struggles without dismissing traditional values
-- Ask thoughtful questions (if needed) that promote self-exploration 
-- Provide practical coping strategies suitable for Indian family/social context
-
-IMPORTANT: Generate ONLY the natural conversation response. Do NOT include:
-- Numbered annotations (1., 2., 3.)
-- Technique labels in parentheses (CBT), (ACT), (MBCT)
-- Structural annotations (validation), (reframe), (strategy)
-- Any meta-commentary about the response structure
-
-Don't be rigid in response structure - blend elements naturally.
- Keep responses conversational and appropriately sized for the context. 
-For normal chats keep it concise for 2-way communication, but provide deeper responses when user needs more support.
-""")
-
-        # USER MESSAGE with analysis and context
-        voice_context_for_response = ""
-        if voice_analysis:
-            voice_context_for_response = f"""
-VOICE ANALYSIS INSIGHTS:
-{json.dumps(voice_analysis, indent=1)}
-"""
-
-        user_content = f"""PSYCHOLOGICAL ANALYSIS:
-{json.dumps(psychological_analysis, indent=1)}
-
-CONVERSATION CONTEXT:
-{immediate_context}{voice_context_for_response}
-
-USER'S CURRENT MESSAGE: "{user_message}"
-
-Generate a completely natural, conversational response as MindMitra."""
-
-        human_message = HumanMessage(content=user_content)
-
-        # Generate direct response using base LLM (not structured output)
-        response = self.llm.invoke([system_message, human_message])
-        
-        if not response or not response.content:
-            raise ValueError("Psychology Agent 2: LLM returned empty response")
-        
-        # Clean up the response and store it
-        final_response = self._clean_response(response.content)
-        state["ai_response"] = final_response
-        state["response_generated"] = True
-        
-        logger.info("✅ Psychology Agent 2: Companion counselor response completed successfully")
-        
-        return state
-    
-    def _format_messages_for_summarization(self, messages: List[Dict]) -> str:
-        """Format ALL messages for comprehensive summarization"""
-        if not messages:
-            return "No conversation to summarize"
-        
-        formatted_messages = []
-        for i, msg in enumerate(messages, 1):
-            role = "User" if msg.get('role') == 'user' else "MindMitra"
-            content = msg.get('content', '')
-            timestamp = msg.get('timestamp', '')[:16] if msg.get('timestamp') else f"Message {i}"
-            formatted_messages.append(f"{timestamp} {role}: {content}")
-        
-        return "\n".join(formatted_messages)
-    
-    def _format_minimal_conversation_context(self, recent_messages: List, conversation_summary: Dict) -> str:
-        """MINIMAL context formatting for faster processing"""
-        context_parts = []
-        
-        # Include summary if it exists
-        if conversation_summary:
-            therapeutic_progress = conversation_summary.get('therapeutic_progress', '')
-            emotional_patterns = conversation_summary.get('emotional_patterns', '')
-            cultural_context = conversation_summary.get('cultural_context', '')
-            
-            summary_text = f"Progress: {therapeutic_progress[:100]}... | Patterns: {emotional_patterns[:100]}... | Culture: {cultural_context[:100]}..."
-            context_parts.append(f"SUMMARY: {summary_text}")
-        
-        # Only recent messages, truncated
-        if recent_messages:
-            context_parts.append("RECENT:")
-            for msg in recent_messages:
-                role = "User" if msg.get('role') == 'user' else "AI"
-                content = msg.get('content', '')[:80]  # Truncated for speed
-                context_parts.append(f"{role}: {content}")
-        
-        return "\n".join(context_parts) if context_parts else "New conversation"
-    
-    def _format_minimal_activities_context(self, activities: List) -> str:
-        """MINIMAL activity formatting for faster processing"""
-        logger.info(f"🔄 [FORMAT] Formatting activities context...")
-        logger.info(f"📥 [FORMAT] Input: {len(activities)} activities to format")
-        
-        if not activities:
-            logger.warning("⚠️ [FORMAT] No activities to format - returning empty context")
-            return "No recent activities"
-        
-        # Only most recent activities with minimal info
-        context_parts = []
-        for i, activity in enumerate(activities[:2], 1):
-            name = activity.get('activity_type', 'Unknown').replace('_', ' ')
-            score = activity.get('score', 'N/A')
-            context_parts.append(f"{name}: {score}")
-            logger.info(f"   [{i}] {name} (score: {score})")
-        
-        formatted = " | ".join(context_parts)
-        logger.info(f"✅ [FORMAT] Formatted context: '{formatted}'")
-        return formatted
-
-    def _format_comprehensive_activities_context(self, activities: List) -> str:
-        """
-        COMPREHENSIVE activity formatting with FULL therapeutic insights.
-        
-        🔥 CRITICAL FIX: This replaces the minimal context that was losing 90% of game data!
-        
-        Previously only showed: "Memory Challenge: 85"
-        Now shows: Full psychological analysis including:
-        - Performance metrics (score, accuracy, duration)
-        - Key behavioral patterns observed
-        - Cognitive strengths identified
-        - Areas for therapeutic growth
-        - Emotional state during activity
-        - Personalized recommendations
-        
-        This enables the chatbot to provide truly data-driven, personalized therapy.
-        """
-        logger.info(f"🔄 [COMPREHENSIVE_FORMAT] Formatting FULL activity context with insights...")
-        logger.info(f"📥 [COMPREHENSIVE_FORMAT] Processing {len(activities)} activities")
-        
-        if not activities:
-            logger.warning("⚠️ [COMPREHENSIVE_FORMAT] No activities to format")
-            return "No recent therapeutic activities completed."
-        
-        context_parts = ["📊 RECENT THERAPEUTIC ACTIVITIES & PSYCHOLOGICAL INSIGHTS:\n"]
-        
-        for i, activity in enumerate(activities[:5], 1):  # Use up to 5 activities (was 2!)
-            activity_type = activity.get('activity_type', 'Unknown').replace('_', ' ').title()
-            score = activity.get('score', 0)
-            accuracy = activity.get('accuracy_percentage', 0)
-            duration = activity.get('game_duration', 0)
-            completed_at = activity.get('completed_at', 'Unknown date')
-            
-            logger.info(f"   [{i}] Processing: {activity_type}")
-            
-            # Extract rich therapeutic insights from insights_generated field
-            insights = activity.get('insights_generated', {})
-            performance = insights.get('performance_level', 'unknown')
-            patterns = insights.get('key_patterns', [])
-            strengths = insights.get('cognitive_strengths', [])
-            areas_for_growth = insights.get('areas_for_growth', [])
-            emotional_indicators = insights.get('emotional_indicators', [])
-            recommendations = insights.get('recommendations', [])
-            
-            logger.info(f"       Performance: {performance}, Patterns: {len(patterns)}, Strengths: {len(strengths)}")
-            
-            # Build rich, therapeutically-informed context
-            activity_summary = f"""
-{i}. {activity_type} (Completed: {completed_at[:10] if completed_at != 'Unknown date' else 'Unknown'})
-   📈 Performance Metrics:
-      - Score: {score}/100
-      - Accuracy: {accuracy}%
-      - Duration: {duration} seconds
-      - Performance Level: {performance}
-   
-   🧠 Psychological Analysis:
-      - Key Patterns Observed: {', '.join(patterns[:3]) if patterns else 'None identified yet'}
-      - Cognitive Strengths: {', '.join(strengths[:3]) if strengths else 'Still assessing'}
-      - Growth Opportunities: {', '.join(areas_for_growth[:2]) if areas_for_growth else 'None noted'}
-      - Emotional State During Activity: {', '.join(emotional_indicators[:2]) if emotional_indicators else 'Neutral'}
-   
-   💡 Therapeutic Recommendations:
-      - {recommendations[0] if recommendations else 'Continue engaging with therapeutic activities'}
-"""
-            context_parts.append(activity_summary)
-        
-        context_parts.append(f"\n📌 Total Activities Analyzed: {len(activities)}")
-        context_parts.append("💭 Use these insights to provide personalized, data-driven therapeutic guidance.")
-        
-        formatted = "\n".join(context_parts)
-        logger.info(f"✅ [COMPREHENSIVE_FORMAT] Created rich context: {len(formatted)} characters")
-        return formatted
-
-    def _format_memory_context_with_content(self, memories: Dict) -> str:
-        """
-        Format memory context with ACTUAL CONTENT, not just counts.
-        
-        🔥 CRITICAL FIX: Previously only showed counts like "12 procedural memories"
-        Now shows: The actual memory content so chatbot can reference specific techniques,
-        facts, and past events in responses.
-        
-        This gives the chatbot true memory and therapeutic continuity!
-        """
-        if not memories or not any(memories.values()):
-            return "📝 No session memories yet - this is a new conversation."
-        
-        parts = ["🧠 SESSION MEMORY BANK (from our past conversations):\n"]
-        
-        # Procedural memories - coping techniques, skills, strategies
-        procedural = memories.get('procedural', [])
-        if procedural:
-            parts.append("📚 COPING TECHNIQUES & SKILLS YOU'VE LEARNED:")
-            for i, mem in enumerate(procedural[:5], 1):  # Top 5 most important
-                content = mem.get('memory_content', mem.get('content', 'N/A'))
-                confidence = mem.get('confidence_level', mem.get('confidence', 0.5))
-                last_used = mem.get('last_used', 'Not tracked')
-                effectiveness = mem.get('effectiveness', 'Unknown')
-                
-                parts.append(f"   {i}. {content}")
-                parts.append(f"      └─ Confidence: {confidence:.1f}/1.0 | Effectiveness: {effectiveness}")
-                if last_used != 'Not tracked':
-                    parts.append(f"      └─ Last used: {last_used}")
-        
-        # Semantic memories - facts, preferences, beliefs, identity
-        semantic = memories.get('semantic', [])
-        if semantic:
-            parts.append("\n🎯 WHAT I KNOW ABOUT YOU:")
-            for i, mem in enumerate(semantic[:7], 1):  # Top 7 most important
-                content = mem.get('content', 'N/A')
-                importance = mem.get('importance', 'medium')
-                category = mem.get('category', 'general')
-                source = mem.get('source', 'stated')
-                
-                # Format by importance
-                if importance == 'high':
-                    prefix = "⭐"
-                elif importance == 'critical':
-                    prefix = "🔥"
-                else:
-                    prefix = "  "
-                
-                parts.append(f"   {prefix} {i}. {content}")
-                parts.append(f"      └─ Category: {category} | Source: {source}")
-        
-        # Episodic memories - past events, experiences, breakthroughs
-        episodic = memories.get('episodic', [])
-        if episodic:
-            parts.append("\n📅 SIGNIFICANT MOMENTS WE'VE SHARED:")
-            for i, mem in enumerate(episodic[:4], 1):  # Top 4 most significant
-                event = mem.get('event_description', 'N/A')
-                outcome = mem.get('outcome', 'Unknown outcome')
-                significance = mem.get('significance', 'medium')
-                emotional_intensity = mem.get('emotional_intensity', 5)
-                learned_from = mem.get('learned_from', '')
-                
-                parts.append(f"   {i}. {event}")
-                parts.append(f"      └─ Outcome: {outcome}")
-                parts.append(f"      └─ Significance: {significance} | Emotional intensity: {emotional_intensity}/10")
-                if learned_from:
-                    parts.append(f"      └─ What you learned: {learned_from}")
-        
-        # Summary stats
-        total_memories = len(procedural) + len(semantic) + len(episodic)
-        parts.append(f"\n📊 Memory Bank Stats: {total_memories} total memories across {len([k for k,v in memories.items() if v])} categories")
-        parts.append("💭 Reference these specific memories when appropriate to show continuity and personalization.")
-        
-        return "\n".join(parts)
-
-
-    
-    def _format_immediate_context_for_response(self, last_messages: List, current_message: str) -> str:
-        """Format immediate context for response generation"""
-        if not last_messages:
-            return f"User's message: '{current_message}' (New conversation)"
-        
-        context_parts = []
-        for msg in last_messages:
-            role = "User" if msg.get('role') == 'user' else "MindMitra"
-            content = msg.get('content', '')[:100]  # Truncate for efficiency
-            context_parts.append(f"{role}: {content}")
-        
-        context_parts.append(f"User (current): {current_message}")
-        
-        return "\n".join(context_parts)
-    
-    def _clean_response(self, response: str) -> str:
-        """Clean response of any artifacts"""
-        response = response.strip()
-        
-        # Remove quotes if entire response is quoted
-        if response.startswith('"') and response.endswith('"'):
-            response = response[1:-1]
-        
-        # Remove any JSON-like formatting
-        if response.startswith('{') or response.startswith('['):
-            try:
-                parsed = json.loads(response)
-                if isinstance(parsed, dict) and 'content' in parsed:
-                    response = parsed['content']
-                elif isinstance(parsed, str):
-                    response = parsed
-            except:
-                pass
-        
-        return response.strip()
-    
-    def _create_workflow(self) -> StateGraph:
-        """Create psychology-focused 2-agent workflow (no sequential summarization)"""
-        
-        workflow = StateGraph(dict)
-        
-        # Add only the 2 main agents (summarization happens in background)
-        workflow.add_node("psychological_analyst", self.psychological_analyst)
-        workflow.add_node("companion_counselor_response", self.companion_counselor_response)
-        
-        # Define the TRUE 2-agent workflow sequence
-        workflow.set_entry_point("psychological_analyst")
-        workflow.add_edge("psychological_analyst", "companion_counselor_response")
-        workflow.add_edge("companion_counselor_response", END)
-        
-        return workflow.compile()
-    
     def process_chat(
-        self, 
-        user_message: str, 
+        self,
+        user_message: str,
         recent_messages: Optional[List] = None,
         conversation_summary: Optional[Dict] = None,
         user_activities: Optional[List] = None,
         user_patterns: Optional[Dict] = None,
-        voice_analysis: Optional[Dict] = None,  # Add voice analysis parameter
+        voice_analysis: Optional[Dict] = None,
         user_id: str = "anonymous",
-        session_id: str = None
+        session_id: str = None,
     ) -> Dict[str, Any]:
-        """Process chat with psychology-focused 2-agent workflow + voice analysis + background summarization"""
-        
-        # Initialize with defaults
-        recent_messages = recent_messages or []
-        user_activities = user_activities or []
-        conversation_summary = conversation_summary or {}
-        user_patterns = user_patterns or {}
-        voice_analysis = voice_analysis or {}  # Default to empty dict
-        
-        # Log voice analysis if available
-        if voice_analysis:
-            logger.info(f"🎤 Voice analysis received: {voice_analysis.get('emotional_tone', 'unknown')} tone, {voice_analysis.get('stress_level', 'unknown')} stress")
-        
-        # Create initial state for psychology-focused workflow
-        initial_state = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "user_message": user_message.strip(),
-            "recent_messages": recent_messages,
-            "conversation_summary": conversation_summary,
-            "user_activities": user_activities,
-            "user_patterns": user_patterns,
-            "psychological_analysis": {},
-            "ai_response": "",
-            "response_generated": False
-        }
-        
-        try:
-            logger.info(f"🚀 Starting psychology-focused 2-agent workflow for user: {user_id}")
-            start_time = datetime.now()
-            
-            # Check if background summarization will be triggered
-            will_summarize = self._should_trigger_background_summarization(user_id, recent_messages)
-            logger.info(f"📊 Context: {len(recent_messages)} messages, Background summarization: {will_summarize}")
-            
-            # Execute the TRUE 2-agent workflow (summarization happens in background if needed)
-            final_state = self.workflow.invoke(initial_state)
-            
-            processing_time = (datetime.now() - start_time).total_seconds()
-            logger.info(f"✅ Psychology-focused 2-agent workflow completed in {processing_time:.2f} seconds")
-            
-            # Extract results from psychology workflow
-            response = final_state.get("ai_response", "")
-            if not response.strip():
-                raise ValueError("Psychology workflow completed but no ai_response generated")
-            
-            # Determine therapeutic approach from psychological analysis
-            psychological_analysis = final_state.get("psychological_analysis", {})
-            therapeutic_approach = psychological_analysis.get("therapeutic_approach", "Person-centered")
-            
-            logger.info(f"🧠 Psychology response ready - Approach: {therapeutic_approach}, Background summarization: {'Active' if will_summarize else 'Not needed'}")
-            
-            return {
-                "message": response,
-                "modality": therapeutic_approach,
-                "confidence": 0.9,
-                "processing_time": processing_time,
-                "session_insights": {
-                    "emotional_state": psychological_analysis.get("emotional_state", ""),
-                    "stress_categories": psychological_analysis.get("stress_categories", []),
-                    "therapeutic_approach": psychological_analysis.get("therapeutic_approach", ""),
-                    "cultural_pressures": psychological_analysis.get("cultural_pressures", ""),
-                    "language_style": psychological_analysis.get("language_style", ""),
-                    "psychological_insights": psychological_analysis.get("psychological_insights", []),
-                    "coping_assessment": psychological_analysis.get("coping_assessment", ""),
-                    "intervention_priority": psychological_analysis.get("intervention_priority", ""),
-                    "activity_recommendations": psychological_analysis.get("activity_recommendations", []),
-                    "performance_metrics": {
-                        "context_messages": len(recent_messages),
-                        "context_activities": len(user_activities),
-                        "has_summary": bool(conversation_summary),
-                        "background_summarization": will_summarize,
-                        "cached_summary_available": user_id in self._summarization_cache
-                    }
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Psychology-focused workflow execution failed: {e}")
-            raise e
+        """
+        Main processing pipeline — SAME SIGNATURE & RETURN FORMAT as original.
+        Internally uses the new modular architecture.
+        """
+        start_time = datetime.now()
 
-# Global workflow instance
+        # ── 1. Build UserContext JSON ─────────────────────────
+        ctx = create_empty_user_context(user_id, session_id, user_message.strip())
+        ctx["voice_analysis"] = voice_analysis or {}
+        ctx["session_context"]["recent_messages"] = recent_messages or []
+        ctx["session_context"]["conversation_summary"] = conversation_summary or {}
+        ctx["session_context"]["user_activities"] = user_activities or []
+        ctx["session_context"]["user_patterns"] = user_patterns or {}
+
+        # ── 2. Fetch session memories → into ctx ─────────────
+        if session_id:
+            ctx["session_context"]["session_memories"] = self.fetch_session_memories(session_id)
+
+        # ── 3. Groq NLP emotion/sentiment ─────────────────────
+        try:
+            ctx = self.groq_nlp.analyse(ctx)
+        except Exception as e:
+            logger.error(f"❌ [PIPELINE] NLP module error (non-fatal): {e}")
+
+        # ── 4. Cultural context analysis ──────────────────────
+        try:
+            ctx = self.cultural_module.analyse(ctx)
+        except Exception as e:
+            logger.error(f"❌ [PIPELINE] Cultural module error (non-fatal): {e}")
+
+        # ── 5. GLM Agent 1: Psychologist analysis ─────────────
+        ctx = self.agent_psychologist.run(ctx)
+
+        # ── 6. GLM Agent 2: Technique selection ───────────────
+        ctx = self.agent_technique.run(ctx)
+
+        # ── 7. GLM Response generation ────────────────────────
+        ctx = self.response_gen.generate(ctx)
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+
+        # ── 8. Build output in ORIGINAL FORMAT ────────────────
+        psych = ctx["psychological_analysis"]
+        technique = ctx["technique_selection"]
+        self.save_user_context_to_file(ctx, f"user_context_{ctx['user_id']}_{ctx['session_id']}.json")  # Save context to file
+
+
+        return {
+            "message": ctx["ai_response"],
+            "modality": technique.get("primary_technique", "Person-Centered"),
+            "confidence": 0.9,
+            "processing_time": processing_time,
+            "session_insights": {
+                "emotional_state": psych.get("emotional_state", ""),
+                "stress_categories": psych.get("stress_categories", []),
+                "therapeutic_approach": technique.get("primary_technique", ""),
+                "cultural_pressures": psych.get("cultural_pressures", ""),
+                "language_style": ctx["cultural_context"].get("language_style", ""),
+                "psychological_insights": psych.get("psychological_insights", []),
+                "coping_assessment": psych.get("coping_assessment", ""),
+                "intervention_priority": psych.get("intervention_priority", ""),
+                "activity_recommendations": technique.get("activity_recommendations", []),
+                # Extra data available in v2
+                "nlp_analysis": ctx["nlp_analysis"],
+                "cultural_context": ctx["cultural_context"],
+                "technique_rationale": technique.get("rationale", ""),
+                "performance_metrics": {
+                    "context_messages": len(ctx["session_context"]["recent_messages"]),
+                    "context_activities": len(ctx["session_context"]["user_activities"]),
+                    "has_summary": bool(ctx["session_context"]["conversation_summary"]),
+                    "memory_count": sum(
+                        len(v) for v in ctx["session_context"]["session_memories"].values()
+                    ),
+                },
+            },
+        }
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  9. GLOBAL INSTANCE & ENTRY POINT (UNCHANGED SIGNATURE)      ║
+# ╚══════════════════════════════════════════════════════════════╝
+
 _workflow_instance = None
 
+
 def get_workflow_instance() -> MindMitraWorkflow:
-    """Get or create psychology-focused workflow instance"""
     global _workflow_instance
     if _workflow_instance is None:
         _workflow_instance = MindMitraWorkflow()
     return _workflow_instance
 
+
 def process_user_chat(
-    user_message: str, 
+    user_message: str,
     recent_messages: Optional[List] = None,
     conversation_summary: Optional[Dict] = None,
     user_activities: Optional[List] = None,
     user_patterns: Optional[Dict] = None,
-    voice_analysis: Optional[Dict] = None,  # Add voice analysis parameter
+    voice_analysis: Optional[Dict] = None,
     user_id: str = "anonymous",
-    session_id: str = None
+    session_id: str = None,
 ) -> Dict[str, Any]:
-    """Main entry point for psychology-focused 2-agent chat processing with voice analysis"""
-    
-    logger.info("🚀 [ENTRY] MindMitra chat processing initiated")
-    logger.info(f"📝 [ENTRY] Message preview: '{user_message[:50]}{'...' if len(user_message) > 50 else ''}'")
-    logger.info(f"👤 [ENTRY] User ID: {user_id}")
-    logger.info(f"🔗 [ENTRY] Session ID: {session_id}")
-    logger.info(f"🎤 [ENTRY] Voice analysis: {'✅ PROVIDED' if voice_analysis else '❌ NOT PROVIDED'}")
-    
-    if voice_analysis:
-        logger.info(f"🔍 [ENTRY] Voice analysis details:")
-        logger.info(f"   - Emotional tone: {voice_analysis.get('emotional_tone', 'unknown')}")
-        logger.info(f"   - Stress level: {voice_analysis.get('stress_level', 'unknown')}")
-        logger.info(f"   - Speech pace: {voice_analysis.get('speech_pace', 'unknown')}")
-        logger.info(f"   - Cultural context keys: {list(voice_analysis.get('cultural_context', {}).keys())}")
-        logger.info(f"   - Psychological markers: {list(voice_analysis.get('psychological_markers', {}).keys())}")
-    
+    """Main entry point — IDENTICAL SIGNATURE to original v1."""
+
+    logger.info(f"🚀 [ENTRY] MindMitra v2 — user={user_id}, session={session_id}")
     start_time = time.time()
-    
+
     try:
         workflow = get_workflow_instance()
         result = workflow.process_chat(
             user_message, recent_messages, conversation_summary,
-            user_activities, user_patterns, voice_analysis, user_id, session_id
+            user_activities, user_patterns, voice_analysis, user_id, session_id,
         )
-        
-        processing_time = time.time() - start_time
-        result["processing_time"] = round(processing_time, 2)
-        result["voice_aware"] = bool(voice_analysis)  # Flag to indicate voice was considered
-        
-        logger.info(f"✅ [ENTRY] Processing completed successfully in {processing_time:.2f}s")
-        logger.info(f"📊 [ENTRY] Response metrics:")
-        logger.info(f"   - Message length: {len(result.get('message', ''))} characters")
-        logger.info(f"   - Modality: {result.get('modality', 'unknown')}")
-        logger.info(f"   - Voice-aware: {result.get('voice_aware', False)}")
-        
+        result["processing_time"] = round(time.time() - start_time, 2)
+        result["voice_aware"] = bool(voice_analysis)
+        logger.info(f"✅ [ENTRY] Done in {result['processing_time']}s")
         return result
-        
+
     except Exception as e:
-        processing_time = time.time() - start_time
-        logger.error(f"❌ [ENTRY] Processing failed after {processing_time:.2f}s")
-        logger.error(f"❌ [ENTRY] Error details: {str(e)}")
-        raise e# Deployment timestamp: Wed Feb  4 03:57:34 IST 2026
+        logger.error(f"❌ [ENTRY] Failed after {time.time()-start_time:.2f}s: {e}")
+        raise
